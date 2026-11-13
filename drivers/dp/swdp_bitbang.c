@@ -437,10 +437,36 @@ static int sw_set_pins(const struct device *dev,
 		       const uint8_t pins, const uint8_t value)
 {
 	const struct sw_config *config = dev->config;
+	uint8_t gpio_pins = pins;
 
 	LOG_DBG("pins 0x%02x value 0x%02x", pins, value);
 
-	if (pins & BIT(SWDP_SWCLK_PIN)) {
+#if defined(SWDP_LL_HAS_PORT_HOOKS)
+	/*
+	 * While the port is on, the SWD pins are routed away from the GPIO
+	 * block, so drive them through the same raw path as the bit-bang loop.
+	 * Otherwise the GPIO API below applies the devicetree polarity.
+	 */
+	if ((pins & BIT(SWDP_SWCLK_PIN)) &&
+	    swdp_ll_port_attached(config->clk_reg, config->clk.pin)) {
+		if (value & BIT(SWDP_SWCLK_PIN)) {
+			pin_swclk_set(dev);
+		} else {
+			pin_swclk_clr(dev);
+		}
+		gpio_pins &= ~BIT(SWDP_SWCLK_PIN);
+	}
+
+	if ((pins & BIT(SWDP_SWDIO_PIN)) &&
+	    (config->dout_reg != NULL ?
+	     swdp_ll_port_attached(config->dout_reg, config->dout.pin) :
+	     swdp_ll_port_attached(config->dio_reg, config->dio.pin))) {
+		pin_swdio_out(dev, (value & BIT(SWDP_SWDIO_PIN)) ? 1U : 0U);
+		gpio_pins &= ~BIT(SWDP_SWDIO_PIN);
+	}
+#endif
+
+	if (gpio_pins & BIT(SWDP_SWCLK_PIN)) {
 		if (value & BIT(SWDP_SWCLK_PIN)) {
 			gpio_pin_set_dt(&config->clk, 1);
 		} else {
@@ -449,7 +475,7 @@ static int sw_set_pins(const struct device *dev,
 	}
 
 	if (config->dout_reg != NULL) {
-		if (pins & BIT(SWDP_SWDIO_PIN)) {
+		if (gpio_pins & BIT(SWDP_SWDIO_PIN)) {
 			if (value & BIT(SWDP_SWDIO_PIN)) {
 				gpio_pin_set_dt(&config->dout, 1);
 			} else {
@@ -457,7 +483,7 @@ static int sw_set_pins(const struct device *dev,
 			}
 		}
 	} else {
-		if (pins & BIT(SWDP_SWDIO_PIN)) {
+		if (gpio_pins & BIT(SWDP_SWDIO_PIN)) {
 			if (value & BIT(SWDP_SWDIO_PIN)) {
 				gpio_pin_set_dt(&config->dio, 1);
 			} else {
@@ -617,6 +643,17 @@ static int sw_port_on(const struct device *dev)
 		}
 	}
 
+	if (FAST_BITBANG_HW_SUPPORT) {
+		swdp_ll_port_attach(config->clk_reg, config->clk.pin, true);
+		swdp_ll_port_attach(config->dio_reg, config->dio.pin, false);
+		if (config->dout_reg != NULL) {
+			swdp_ll_port_attach(config->dout_reg, config->dout.pin, true);
+		}
+		if (config->dnoe_reg != NULL) {
+			swdp_ll_port_attach(config->dnoe_reg, config->dnoe.pin, true);
+		}
+	}
+
 	return 0;
 }
 
@@ -626,6 +663,17 @@ static int sw_port_off(const struct device *dev)
 	int ret;
 	const gpio_flags_t off_flags = IS_ENABLED(CONFIG_SWDP_BITBANG_NO_DISCONNECT) ?
 		GPIO_INPUT : GPIO_DISCONNECTED;
+
+	if (FAST_BITBANG_HW_SUPPORT) {
+		swdp_ll_port_detach(config->clk_reg, config->clk.pin);
+		swdp_ll_port_detach(config->dio_reg, config->dio.pin);
+		if (config->dout_reg != NULL) {
+			swdp_ll_port_detach(config->dout_reg, config->dout.pin);
+		}
+		if (config->dnoe_reg != NULL) {
+			swdp_ll_port_detach(config->dnoe_reg, config->dnoe.pin);
+		}
+	}
 
 	/* If there is a transceiver connected to IO, pins should always be driven. */
 	if (config->dnoe.port) {
