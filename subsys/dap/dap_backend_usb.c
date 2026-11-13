@@ -18,8 +18,6 @@ LOG_MODULE_REGISTER(dap_usb, CONFIG_DAP_LOG_LEVEL);
  * This file implements CMSIS DAP USB backend function using bulk endpoints.
  */
 
-static uint8_t response_buf[512];
-
 NET_BUF_POOL_FIXED_DEFINE(dap_func_pool,
 			  1, 0, sizeof(struct udc_buf_info), NULL);
 
@@ -43,7 +41,17 @@ struct dap_func_data {
 	struct usbd_desc_node *const iface_str_desc_nd;
 	atomic_t state;
 	struct dap_link_context *dap_link_ctx;
+	struct usbd_class_data *c_data;
+	struct net_buf *cmd_buf;
+	struct k_work cmd_work;
+	struct k_work release_work;
 };
+
+/*
+ * Commands run on their own queue: they wait for the DAP lock, which another
+ * backend may hold for a long transfer, and must not stall the USB stack.
+ */
+static struct k_work_q dap_func_work_q;
 
 static uint8_t dap_func_get_bulk_out(struct usbd_class_data *const c_data)
 {
@@ -71,6 +79,39 @@ static uint8_t dap_func_get_bulk_in(struct usbd_class_data *const c_data)
 	return desc->if0_in_ep.bEndpointAddress;
 }
 
+static void dap_func_cmd_handler(struct k_work *work)
+{
+	struct dap_func_data *data = CONTAINER_OF(work, struct dap_func_data, cmd_work);
+	struct usbd_class_data *c_data = data->c_data;
+	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+	struct net_buf *buf = data->cmd_buf;
+	struct udc_buf_info *bi = udc_get_buf_info(buf);
+	static uint8_t response_buf[512];
+	size_t len;
+
+	len = dap_link_execute_cmd(data->dap_link_ctx, buf->data, response_buf);
+	net_buf_reset(buf);
+	LOG_DBG("response length %zu, starting with [0x%02X, 0x%02X]", len, response_buf[0],
+		response_buf[1]);
+	net_buf_add_mem(buf, response_buf, MIN(len, net_buf_tailroom(buf)));
+
+	memset(bi, 0, sizeof(struct udc_buf_info));
+	bi->ep = dap_func_get_bulk_in(c_data);
+
+	if (!atomic_test_bit(&data->state, SAMPLE_FUNCTION_ENABLED) ||
+	    usbd_ep_enqueue(c_data, buf) != 0) {
+		LOG_ERR("Failed to enqueue buffer");
+		usbd_ep_buf_free(uds_ctx, buf);
+	}
+}
+
+static void dap_func_release_handler(struct k_work *work)
+{
+	struct dap_func_data *data = CONTAINER_OF(work, struct dap_func_data, release_work);
+
+	(void)dap_link_release(data->dap_link_ctx);
+}
+
 static int dap_func_request_handler(struct usbd_class_data *c_data,
 				  struct net_buf *buf, int err)
 {
@@ -83,23 +124,16 @@ static int dap_func_request_handler(struct usbd_class_data *c_data,
 		(void *)c_data, bi->ep, buf->len, err);
 
 	if (atomic_test_bit(&data->state, SAMPLE_FUNCTION_ENABLED) && err == 0) {
-		uint8_t ep = bi->ep;
-		size_t len;
+		if (bi->ep != dap_func_get_bulk_in(c_data)) {
+			/* The pool holds one buffer, so no command is pending */
+			data->cmd_buf = buf;
+			(void)k_work_submit_to_queue(&dap_func_work_q, &data->cmd_work);
+			return 0;
+		}
 
 		memset(bi, 0, sizeof(struct udc_buf_info));
-		if (ep == dap_func_get_bulk_in(c_data)) {
-			bi->ep = dap_func_get_bulk_out(c_data);
-			net_buf_reset(buf);
-		} else {
-			bi->ep = dap_func_get_bulk_in(c_data);
-
-			len = dap_link_execute_cmd(data->dap_link_ctx,
-						   buf->data, response_buf);
-			net_buf_reset(buf);
-			LOG_DBG("response length %u, starting with [0x%02X, 0x%02X]",
-				len, response_buf[0], response_buf[1]);
-			net_buf_add_mem(buf, response_buf, MIN(len, net_buf_tailroom(buf)));
-		}
+		bi->ep = dap_func_get_bulk_out(c_data);
+		net_buf_reset(buf);
 
 		if (usbd_ep_enqueue(c_data, buf)) {
 			LOG_ERR("Failed to enqueue buffer");
@@ -185,6 +219,7 @@ static void dap_func_disable(struct usbd_class_data *const c_data)
 	struct dap_func_data *data = usbd_class_get_private(c_data);
 
 	atomic_clear_bit(&data->state, SAMPLE_FUNCTION_ENABLED);
+	(void)k_work_submit_to_queue(&dap_func_work_q, &data->release_work);
 	LOG_INF("Configuration disabled");
 }
 
@@ -200,6 +235,8 @@ static int dap_func_init(struct usbd_class_data *c_data)
 	}
 
 	LOG_DBG("Init class instance %p", (void *)c_data);
+
+	data->c_data = c_data;
 
 	if (usbd_add_descriptor(uds_ctx, data->iface_str_desc_nd)) {
 		LOG_ERR("Failed to add interface string descriptor");
@@ -317,8 +354,19 @@ int dap_link_backend_usb_init(struct dap_link_context *const dap_link_ctx)
 	struct usbd_class_data *const c_data = &dap_func_0;
 	struct dap_func_data *data = usbd_class_get_private(c_data);
 
+	static K_THREAD_STACK_DEFINE(dap_func_stack, CONFIG_DAP_BACKEND_USB_STACK_SIZE);
+	const struct k_work_queue_config cfg = {.name = "dap_usb"};
+
 	if (atomic_test_bit(&data->state, SAMPLE_FUNCTION_ENABLED)) {
 		return -EALREADY;
+	}
+
+	if (data->dap_link_ctx == NULL) {
+		k_work_init(&data->cmd_work, dap_func_cmd_handler);
+		k_work_init(&data->release_work, dap_func_release_handler);
+		k_work_queue_start(&dap_func_work_q, dap_func_stack,
+				   K_THREAD_STACK_SIZEOF(dap_func_stack),
+				   K_PRIO_PREEMPT(CONFIG_DAP_BACKEND_USB_THREAD_PRIORITY), &cfg);
 	}
 
 	data->dap_link_ctx = dap_link_ctx;

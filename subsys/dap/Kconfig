@@ -47,6 +47,18 @@ config DAP_BACKEND_USB
 	help
 	  DAP USB backend using bulk endpoints.
 
+if DAP_BACKEND_USB
+
+config DAP_BACKEND_USB_STACK_SIZE
+	int "Thread stack size"
+	default 1536
+
+config DAP_BACKEND_USB_THREAD_PRIORITY
+	int "Thread priority"
+	default 7
+
+endif # DAP_BACKEND_USB
+
 module = DAP
 module-str = dap
 source "subsys/logging/Kconfig.template.log_config"
