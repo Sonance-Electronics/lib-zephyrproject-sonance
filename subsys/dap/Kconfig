@@ -59,6 +59,51 @@ config DAP_BACKEND_USB_THREAD_PRIORITY
 
 endif # DAP_BACKEND_USB
 
+config DAP_BACKEND_TCP
+	bool "TCP backend"
+	depends on NET_SOCKETS && NET_TCP && NET_IPV4
+	select NET_CONTEXT_RCVTIMEO
+	select NET_CONTEXT_SNDTIMEO
+	select NET_TCP_KEEPALIVE
+	help
+	  DAP backend that serves one CMSIS-DAP client over TCP, using the
+	  framing of the OpenOCD cmsis-dap tcp backend: an 8-byte little-endian
+	  header (signature "DAP\0", 16-bit payload length, packet type and a
+	  reserved byte) followed by one CMSIS-DAP request or response.
+
+if DAP_BACKEND_TCP
+
+config DAP_BACKEND_TCP_PORT
+	int "TCP port"
+	default 4441
+	range 1 65535
+
+config DAP_BACKEND_TCP_PKT_SIZE
+	int "Packet size"
+	default 1024
+	range 64 4096
+	help
+	  CMSIS-DAP packet size reported to the host. Larger packets let the
+	  host batch more transfers per network round trip.
+
+config DAP_BACKEND_TCP_STACK_SIZE
+	int "Thread stack size"
+	default 3072
+
+config DAP_BACKEND_TCP_THREAD_PRIORITY
+	int "Thread priority"
+	default 7
+
+config DAP_BACKEND_TCP_TIMEOUT_MS
+	int "Packet timeout in milliseconds"
+	default 5000
+	help
+	  The client is dropped when the rest of a request does not arrive,
+	  or a response cannot be sent, within this time. A client that
+	  disappears between requests is dropped by TCP keepalive.
+
+endif # DAP_BACKEND_TCP
+
 module = DAP
 module-str = dap
 source "subsys/logging/Kconfig.template.log_config"
