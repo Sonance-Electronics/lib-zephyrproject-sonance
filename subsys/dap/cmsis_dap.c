@@ -1047,29 +1047,191 @@ static uint16_t dap_process_cmd(struct dap_link_context *const ctx,
 	return (1U + retval);
 }
 
+/*
+ * Check that a command fits before it is executed: its request within
+ * req_avail bytes and its largest response within rsp_avail bytes.
+ * Returns the request length, or 0 if the command does not fit.
+ * Unsupported commands only consume their command byte.
+ */
+static size_t dap_cmd_check(const uint8_t *const request, size_t req_avail, size_t rsp_avail)
+{
+	size_t req_len;
+	size_t rsp_len;
+
+	if (req_avail < 1U) {
+		return 0U;
+	}
+
+	switch (request[0]) {
+	case ID_DAP_INFO:
+		req_len = 2U;
+		rsp_len = CMSIS_DAP_PACKET_MIN_SIZE;
+		break;
+	case ID_DAP_HOST_STATUS:
+	case ID_DAP_DELAY:
+		req_len = 3U;
+		rsp_len = 2U;
+		break;
+	case ID_DAP_CONNECT:
+	case ID_DAP_SWDP_CONFIGURE:
+		req_len = 2U;
+		rsp_len = 2U;
+		break;
+	case ID_DAP_DISCONNECT:
+		req_len = 1U;
+		rsp_len = 2U;
+		break;
+	case ID_DAP_RESET_TARGET:
+		req_len = 1U;
+		rsp_len = 3U;
+		break;
+	case ID_DAP_SWJ_PINS:
+		req_len = 7U;
+		rsp_len = 2U;
+		break;
+	case ID_DAP_SWJ_CLOCK:
+		req_len = 5U;
+		rsp_len = 2U;
+		break;
+	case ID_DAP_TRANSFER_CONFIGURE:
+	case ID_DAP_WRITE_ABORT:
+		req_len = 6U;
+		rsp_len = 2U;
+		break;
+	case ID_DAP_SWJ_SEQUENCE: {
+		/* Bit count, 256 encoded as 0, then the bits */
+		size_t bits;
+
+		if (req_avail < 2U) {
+			return 0U;
+		}
+
+		bits = (request[1] == 0U) ? 256U : request[1];
+		req_len = 2U + DIV_ROUND_UP(bits, 8U);
+		rsp_len = 2U;
+		break;
+	}
+	case ID_DAP_SWDP_SEQUENCE:
+		/* Sequence count, then per sequence an info byte and output data */
+		if (req_avail < 2U) {
+			return 0U;
+		}
+
+		req_len = 2U;
+		rsp_len = 2U;
+		for (uint8_t i = 0U; i < request[1]; i++) {
+			uint8_t info;
+			uint8_t cycles;
+			size_t bytes;
+
+			if (req_avail < req_len + 1U) {
+				return 0U;
+			}
+
+			info = request[req_len++];
+			cycles = info & BIT_MASK(6);
+			bytes = (cycles == 0U) ? 8U : DIV_ROUND_UP(cycles, 8U);
+			if ((info & BIT(7)) != 0U) {
+				rsp_len += bytes;
+			} else {
+				req_len += bytes;
+			}
+		}
+		break;
+	case ID_DAP_TRANSFER:
+		/* DAP index and count, then per transfer a request byte and data */
+		if (req_avail < 3U) {
+			return 0U;
+		}
+
+		req_len = 3U;
+		rsp_len = 3U;
+		for (uint8_t i = 0U; i < request[2]; i++) {
+			uint8_t req_val;
+
+			if (req_avail < req_len + 1U) {
+				return 0U;
+			}
+
+			req_val = request[req_len++];
+			if ((req_val & SWDP_REQUEST_RnW) == 0U ||
+			    (req_val & DAP_TRANSFER_MATCH_VALUE) != 0U) {
+				req_len += sizeof(uint32_t);
+			} else {
+				rsp_len += sizeof(uint32_t);
+			}
+		}
+		break;
+	case ID_DAP_TRANSFER_BLOCK: {
+		/* DAP index, 16-bit count and request byte, then the data */
+		size_t data_len;
+
+		if (req_avail < 5U) {
+			return 0U;
+		}
+
+		data_len = sys_get_le16(&request[2]) * sizeof(uint32_t);
+		req_len = 5U;
+		rsp_len = 4U;
+		if ((request[4] & SWDP_REQUEST_RnW) != 0U) {
+			rsp_len += data_len;
+		} else {
+			req_len += data_len;
+		}
+		break;
+	}
+	default:
+		req_len = 1U;
+		rsp_len = 2U;
+		break;
+	}
+
+	if (req_len > req_avail || rsp_len > rsp_avail) {
+		LOG_WRN("Command 0x%02x exceeds the packet size", request[0]);
+		return 0U;
+	}
+
+	return req_len;
+}
+
+/*
+ * Both buffers hold one packet. Commands that do not fit in it are refused,
+ * and DAP_ExecuteCommands stops at the first one.
+ */
 static uint32_t dap_link_execute_cmd_locked(struct dap_link_context *const dap_link_ctx,
 					    const uint8_t *request, uint8_t *response)
 {
-	uint32_t retval;
-	uint16_t n;
-	uint8_t count;
+	const size_t pkt_size = dap_link_ctx->pkt_size;
 
 	if (request[0] == ID_DAP_EXECUTE_COMMANDS) {
-		/* copy command and increment */
-		*response++ = *request++;
-		count = request[0];
-		request += sizeof(count);
-		response[0] = count;
-		response += sizeof(count);
-		retval = sizeof(count) + 1U;
-		LOG_WRN("(untested) ID DAP EXECUTE_COMMANDS count %u", count);
-		while (count--) {
-			n = dap_process_cmd(dap_link_ctx, request, response);
-			retval += n;
-			request += n;
-			response += n;
+		size_t req_off = 2U;
+		size_t rsp_off = 2U;
+		uint8_t done = 0U;
+
+		response[0] = ID_DAP_EXECUTE_COMMANDS;
+		LOG_DBG("ID DAP EXECUTE_COMMANDS count %u", request[1]);
+
+		while (done < request[1]) {
+			size_t len;
+
+			len = dap_cmd_check(&request[req_off], pkt_size - req_off,
+					    pkt_size - rsp_off);
+			if (len == 0U) {
+				break;
+			}
+
+			rsp_off += dap_process_cmd(dap_link_ctx, &request[req_off],
+						   &response[rsp_off]);
+			req_off += len;
+			done++;
 		}
-		return retval;
+
+		response[1] = done;
+		return rsp_off;
+	}
+
+	if (dap_cmd_check(request, pkt_size, pkt_size) == 0U) {
+		return dap_cmd_refuse(request, response);
 	}
 
 	return dap_process_cmd(dap_link_ctx, request, response);
@@ -1077,8 +1239,8 @@ static uint32_t dap_link_execute_cmd_locked(struct dap_link_context *const dap_l
 
 /*
  * Execute DAP command (process request and prepare response)
- *   request:  pointer to request data
- *   response: pointer to response data
+ *   request:  pointer to request data, pkt_size bytes
+ *   response: pointer to response data, pkt_size bytes
  *   return:   number of bytes in response
  */
 uint32_t dap_link_execute_cmd(struct dap_link_context *const dap_link_ctx, const uint8_t *request,
