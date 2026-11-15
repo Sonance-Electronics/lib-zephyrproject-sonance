@@ -29,6 +29,17 @@ static ALWAYS_INLINE void pin_delay_asm(uint32_t delay)
 #endif
 }
 
+/* Roles of the SWD pins, for SoCs that keep per-role state while the port is on */
+enum swdp_ll_role {
+	SWDP_LL_ROLE_CLK,
+	SWDP_LL_ROLE_DIO,
+	SWDP_LL_ROLE_DOUT,
+	SWDP_LL_ROLE_DNOE,
+	/* SWDIO output: DOUT if present, otherwise DIO */
+	SWDP_LL_ROLE_SWDIO_OUT,
+	SWDP_LL_ROLE_COUNT,
+};
+
 #if defined(CONFIG_SOC_SERIES_NRF52) || defined(CONFIG_SOC_SERIES_NRF53)
 
 #include "swdp_ll_pin_nrf.h"
@@ -77,14 +88,41 @@ static ALWAYS_INLINE uint32_t swdp_ll_pin_get(void *const base, uint8_t pin)
 #ifndef SWDP_LL_HAS_PORT_HOOKS
 /*
  * Optional hooks for SoCs that switch the SWD pins to a faster access path
- * while the debug port is on.
+ * while the debug port is on. The role operations return true when they
+ * handled the access, and false to fall back to the base/pin operations.
  */
-static ALWAYS_INLINE void swdp_ll_port_attach(void *const base, uint8_t pin, bool output)
+static ALWAYS_INLINE void swdp_ll_port_attach(void *const base, uint8_t pin, bool output,
+					      enum swdp_ll_role role)
 {
 }
 
 static ALWAYS_INLINE void swdp_ll_port_detach(void *const base, uint8_t pin)
 {
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_set(enum swdp_ll_role role)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_clr(enum swdp_ll_role role)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_get(enum swdp_ll_role role, uint32_t *const val)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_output(enum swdp_ll_role role)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_input(enum swdp_ll_role role)
+{
+	return false;
 }
 #endif
 
