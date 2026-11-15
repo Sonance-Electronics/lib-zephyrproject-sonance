@@ -81,6 +81,13 @@ static inline void swdp_ll_port_attach(void *const base, uint8_t pin, bool outpu
 		RV_SET_CSR(CSR_GPIO_OEN_USER, BIT(ch));
 	}
 
+	/*
+	 * Back-to-back CSR writes give fast edges, and at the default pad
+	 * drive they ring enough on ordinary jumper wires for the target to
+	 * see extra SWCLK edges, which garbles the ACK at any clock rate.
+	 * The weakest drive keeps the edges clean.
+	 */
+	gpio_ll_set_drive_capability(&GPIO, num, GPIO_DRIVE_CAP_0);
 	gpio_ll_input_enable(&GPIO, num);
 	esp_rom_gpio_connect_in_signal(num, CORE_GPIO_IN_PAD_IN0_IDX + ch, false);
 	esp_rom_gpio_connect_out_signal(num, CORE_GPIO_OUT_PAD_OUT0_IDX + ch, false, false);
