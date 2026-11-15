@@ -37,6 +37,9 @@ static uint8_t swdp_esp32_chan[SWDP_ESP32_NUM_GPIO] = {
 };
 static uint8_t swdp_esp32_chan_used;
 
+/* CSR bit of each attached role, 0 while the role is not routed */
+static uint32_t swdp_esp32_role_mask[SWDP_LL_ROLE_COUNT];
+
 /*
  * The SoC has a single GPIO block. Zephyr splits it into gpio0 (pins 0-31)
  * and gpio1 (pins 32 and up), and the gpio1 node address only identifies
@@ -54,7 +57,8 @@ static ALWAYS_INLINE uint32_t swdp_ll_pin_num(void *const base, uint8_t pin)
 }
 
 /* Route a pin to a dedicated GPIO channel, initially as output or input */
-static inline void swdp_ll_port_attach(void *const base, uint8_t pin, bool output)
+static inline void swdp_ll_port_attach(void *const base, uint8_t pin, bool output,
+				       enum swdp_ll_role role)
 {
 	uint32_t num = swdp_ll_pin_num(base, pin);
 	uint8_t ch = swdp_esp32_chan[num];
@@ -93,6 +97,12 @@ static inline void swdp_ll_port_attach(void *const base, uint8_t pin, bool outpu
 	esp_rom_gpio_connect_out_signal(num, CORE_GPIO_OUT_PAD_OUT0_IDX + ch, false, false);
 
 	swdp_esp32_chan[num] = ch;
+
+	swdp_esp32_role_mask[role] = BIT(ch);
+	if (role == SWDP_LL_ROLE_DOUT ||
+	    (role == SWDP_LL_ROLE_DIO && swdp_esp32_role_mask[SWDP_LL_ROLE_SWDIO_OUT] == 0U)) {
+		swdp_esp32_role_mask[SWDP_LL_ROLE_SWDIO_OUT] = BIT(ch);
+	}
 }
 
 /* Hand a pin back to the GPIO block */
@@ -112,6 +122,77 @@ static inline void swdp_ll_port_detach(void *const base, uint8_t pin)
 
 	swdp_esp32_chan[num] = SWDP_ESP32_NO_CHAN;
 	swdp_esp32_chan_used &= ~BIT(ch);
+
+	for (int r = 0; r < SWDP_LL_ROLE_COUNT; r++) {
+		if (swdp_esp32_role_mask[r] == BIT(ch)) {
+			swdp_esp32_role_mask[r] = 0U;
+		}
+	}
+}
+
+/*
+ * Role operations: one load and one CSR access per pin change, which keeps
+ * the bit-bang loop close to the CSR access time. They report false while
+ * the role is not routed so the caller falls back to the GPIO block.
+ */
+static ALWAYS_INLINE bool swdp_ll_role_set(enum swdp_ll_role role)
+{
+	uint32_t mask = swdp_esp32_role_mask[role];
+
+	if (mask == 0U) {
+		return false;
+	}
+
+	RV_SET_CSR(CSR_GPIO_OUT_USER, mask);
+	return true;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_clr(enum swdp_ll_role role)
+{
+	uint32_t mask = swdp_esp32_role_mask[role];
+
+	if (mask == 0U) {
+		return false;
+	}
+
+	RV_CLEAR_CSR(CSR_GPIO_OUT_USER, mask);
+	return true;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_get(enum swdp_ll_role role, uint32_t *const val)
+{
+	uint32_t mask = swdp_esp32_role_mask[role];
+
+	if (mask == 0U) {
+		return false;
+	}
+
+	*val = (RV_READ_CSR(CSR_GPIO_IN_USER) & mask) != 0U ? 1U : 0U;
+	return true;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_output(enum swdp_ll_role role)
+{
+	uint32_t mask = swdp_esp32_role_mask[role];
+
+	if (mask == 0U) {
+		return false;
+	}
+
+	RV_CLEAR_CSR(CSR_GPIO_OEN_USER, mask);
+	return true;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_input(enum swdp_ll_role role)
+{
+	uint32_t mask = swdp_esp32_role_mask[role];
+
+	if (mask == 0U) {
+		return false;
+	}
+
+	RV_SET_CSR(CSR_GPIO_OEN_USER, mask);
+	return true;
 }
 
 static ALWAYS_INLINE void swdp_ll_pin_input(void *const base, uint8_t pin)

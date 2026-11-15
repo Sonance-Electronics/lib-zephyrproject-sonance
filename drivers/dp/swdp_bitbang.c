@@ -67,6 +67,10 @@ static ALWAYS_INLINE void pin_swclk_set(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
 
+	if (swdp_ll_role_set(SWDP_LL_ROLE_CLK)) {
+		return;
+	}
+
 	if (FAST_BITBANG_HW_SUPPORT) {
 		swdp_ll_pin_set(config->clk_reg, config->clk.pin);
 	} else {
@@ -79,6 +83,10 @@ static ALWAYS_INLINE void pin_swclk_clr(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
 
+	if (swdp_ll_role_clr(SWDP_LL_ROLE_CLK)) {
+		return;
+	}
+
 	if (FAST_BITBANG_HW_SUPPORT) {
 		swdp_ll_pin_clr(config->clk_reg, config->clk.pin);
 	} else {
@@ -90,6 +98,10 @@ static ALWAYS_INLINE void pin_swclk_clr(const struct device *dev)
 static ALWAYS_INLINE void pin_swdio_set(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
+
+	if (swdp_ll_role_set(SWDP_LL_ROLE_SWDIO_OUT)) {
+		return;
+	}
 
 	if (config->dout.port) {
 		if (FAST_BITBANG_HW_SUPPORT) {
@@ -110,6 +122,10 @@ static ALWAYS_INLINE void pin_swdio_set(const struct device *dev)
 static ALWAYS_INLINE void pin_swdio_clr(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
+
+	if (swdp_ll_role_clr(SWDP_LL_ROLE_SWDIO_OUT)) {
+		return;
+	}
 
 	if (config->dout.port) {
 		if (FAST_BITBANG_HW_SUPPORT) {
@@ -141,6 +157,11 @@ static ALWAYS_INLINE void pin_swdio_out(const struct device *dev,
 static ALWAYS_INLINE uint32_t pin_swdio_in(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
+	uint32_t val;
+
+	if (swdp_ll_role_get(SWDP_LL_ROLE_DIO, &val)) {
+		return val;
+	}
 
 	if (FAST_BITBANG_HW_SUPPORT) {
 		return swdp_ll_pin_get(config->dio_reg, config->dio.pin);
@@ -156,6 +177,10 @@ static ALWAYS_INLINE uint32_t pin_swdio_in(const struct device *dev)
 static ALWAYS_INLINE void pin_swdio_out_enable(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
+
+	if (swdp_ll_role_set(SWDP_LL_ROLE_DNOE) || swdp_ll_role_output(SWDP_LL_ROLE_DIO)) {
+		return;
+	}
 
 	if (config->dnoe.port) {
 		if (FAST_BITBANG_HW_SUPPORT) {
@@ -178,6 +203,10 @@ static ALWAYS_INLINE void pin_swdio_out_enable(const struct device *dev)
 static ALWAYS_INLINE void pin_swdio_out_disable(const struct device *dev)
 {
 	const struct sw_config *config = dev->config;
+
+	if (swdp_ll_role_clr(SWDP_LL_ROLE_DNOE) || swdp_ll_role_input(SWDP_LL_ROLE_DIO)) {
+		return;
+	}
 
 	if (config->dnoe.port) {
 		if (FAST_BITBANG_HW_SUPPORT) {
@@ -637,13 +666,15 @@ static int sw_port_on(const struct device *dev)
 	}
 
 	if (FAST_BITBANG_HW_SUPPORT) {
-		swdp_ll_port_attach(config->clk_reg, config->clk.pin, true);
-		swdp_ll_port_attach(config->dio_reg, config->dio.pin, false);
+		swdp_ll_port_attach(config->clk_reg, config->clk.pin, true, SWDP_LL_ROLE_CLK);
+		swdp_ll_port_attach(config->dio_reg, config->dio.pin, false, SWDP_LL_ROLE_DIO);
 		if (config->dout_reg != NULL) {
-			swdp_ll_port_attach(config->dout_reg, config->dout.pin, true);
+			swdp_ll_port_attach(config->dout_reg, config->dout.pin, true,
+					    SWDP_LL_ROLE_DOUT);
 		}
 		if (config->dnoe_reg != NULL) {
-			swdp_ll_port_attach(config->dnoe_reg, config->dnoe.pin, true);
+			swdp_ll_port_attach(config->dnoe_reg, config->dnoe.pin, true,
+					    SWDP_LL_ROLE_DNOE);
 		}
 	}
 
