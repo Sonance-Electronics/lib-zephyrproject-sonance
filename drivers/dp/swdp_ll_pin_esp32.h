@@ -43,6 +43,9 @@ static uint8_t swdp_esp32_chan[SWDP_ESP32_NUM_GPIO] = {
 };
 static uint8_t swdp_esp32_chan_used;
 
+/* Pad drive of each channel's pin before attach, restored on detach */
+static gpio_drive_cap_t swdp_esp32_drive[SWDP_ESP32_NUM_CHAN];
+
 /*
  * The SoC has a single GPIO block. Zephyr splits it into gpio0 (pins 0-31)
  * and gpio1 (pins 32 and up), and the gpio1 node address only identifies
@@ -88,6 +91,7 @@ static inline void swdp_ll_port_attach(void *const base, uint8_t pin, bool outpu
 
 		ch = (uint8_t)find_lsb_set(~swdp_esp32_chan_used) - 1U;
 		swdp_esp32_chan_used |= BIT(ch);
+		gpio_ll_get_drive_capability(&GPIO, num, &swdp_esp32_drive[ch]);
 	}
 
 	/*
@@ -106,6 +110,13 @@ static inline void swdp_ll_port_attach(void *const base, uint8_t pin, bool outpu
 		RV_SET_CSR(CSR_GPIO_OEN_USER, BIT(ch));
 	}
 
+	/*
+	 * Back-to-back CSR writes give fast edges, and at the default pad
+	 * drive they ring enough on ordinary jumper wires for the target to
+	 * see extra SWCLK edges, which garbles the ACK at any clock rate.
+	 * The weakest drive keeps the edges clean.
+	 */
+	gpio_ll_set_drive_capability(&GPIO, num, GPIO_DRIVE_CAP_0);
 	gpio_ll_input_enable(&GPIO, num);
 	esp_rom_gpio_connect_in_signal(num, CORE_GPIO_IN_PAD_IN0_IDX + ch, false);
 	esp_rom_gpio_connect_out_signal(num, CORE_GPIO_OUT_PAD_OUT0_IDX + ch, false, false);
@@ -124,6 +135,7 @@ static inline void swdp_ll_port_detach(void *const base, uint8_t pin)
 	}
 
 	gpio_ll_set_level(&GPIO, num, (RV_READ_CSR(CSR_GPIO_OUT_USER) >> ch) & 1U);
+	gpio_ll_set_drive_capability(&GPIO, num, swdp_esp32_drive[ch]);
 	esp_rom_gpio_connect_out_signal(num, SIG_GPIO_OUT_IDX, false, false);
 	esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ZERO_INPUT, CORE_GPIO_IN_PAD_IN0_IDX + ch,
 				       false);
