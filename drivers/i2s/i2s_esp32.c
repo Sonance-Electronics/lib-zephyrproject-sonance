@@ -55,6 +55,8 @@ LOG_MODULE_REGISTER(i2s_esp32, CONFIG_I2S_LOG_LEVEL);
 #define I2S_ESP32_CLK_SRC I2S_CLK_SRC_DEFAULT
 #endif
 #define I2S_ESP32_DMA_BUFFER_MAX_SIZE 4092
+/* TDM frames carry up to 16 slots */
+#define I2S_ESP32_TDM_SLOTS_MAX       16U
 
 #define I2S_ESP32_NUM_INST_OK          DT_NUM_INST_STATUS_OKAY(espressif_esp32_i2s)
 #define I2S_ESP32_IS_DIR_INST_EN(i, d) DT_INST_DMAS_HAS_NAME(i, d) || DT_INST_IRQ_HAS_NAME(i, d)
@@ -163,8 +165,26 @@ static uint32_t i2s_esp32_set_apll_freq(uint32_t mclk_hz, uint32_t *div)
 }
 #endif /* CONFIG_I2S_ESP32_CLK_SRC_APLL */
 
+/*
+ * The source clock of a direction: a clock target samples BCLK and WS with
+ * its own module clock, which has to run well above BCLK, so on ESP32-P4 it
+ * runs from the 160 MHz PLL whatever the controller's source; the APLL tops
+ * out below that and is left to a clock controller.
+ */
+static i2s_clock_src_t i2s_esp32_clk_src(bool is_target)
+{
+#if defined(CONFIG_SOC_SERIES_ESP32P4)
+	if (is_target) {
+		return I2S_CLK_SRC_PLL_160M;
+	}
+#else
+	ARG_UNUSED(is_target);
+#endif
+	return I2S_ESP32_CLK_SRC;
+}
+
 static esp_err_t i2s_esp32_calculate_clock(const struct i2s_config *i2s_cfg, uint8_t channel_length,
-					   i2s_hal_clock_info_t *i2s_hal_clock_info)
+					   bool is_target, i2s_hal_clock_info_t *i2s_hal_clock_info)
 {
 	uint16_t mclk_multiple = 256;
 
@@ -180,31 +200,44 @@ static esp_err_t i2s_esp32_calculate_clock(const struct i2s_config *i2s_cfg, uin
 		mclk_multiple = 384;
 	}
 
-	if (i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET ||
-	    i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET) {
-		i2s_hal_clock_info->bclk_div = 8;
-		i2s_hal_clock_info->bclk =
-			i2s_cfg->frame_clk_freq * i2s_cfg->channels * channel_length;
-		i2s_hal_clock_info->mclk = i2s_cfg->frame_clk_freq * i2s_hal_clock_info->bclk_div;
+	i2s_hal_clock_info->bclk = i2s_cfg->frame_clk_freq * i2s_cfg->channels * channel_length;
+
+	if (is_target) {
+		/*
+		 * The module clock samples the incoming BCLK: run it at half
+		 * the source, an integer division, well above BCLK.
+		 */
+		i2s_hal_clock_info->sclk = i2s_esp32_get_source_clk_freq(i2s_esp32_clk_src(true));
+		i2s_hal_clock_info->mclk = i2s_hal_clock_info->sclk / 2U;
+		i2s_hal_clock_info->bclk_div =
+			MAX(i2s_hal_clock_info->mclk / i2s_hal_clock_info->bclk, 1U);
 	} else {
-		i2s_hal_clock_info->bclk =
-			i2s_cfg->frame_clk_freq * i2s_cfg->channels * channel_length;
+		/*
+		 * MCLK is mclk_multiple times the frame clock unless BCLK
+		 * needs more (TDM with many slots): then the least multiple of
+		 * BCLK at or above it, and at least twice BCLK.
+		 */
 		i2s_hal_clock_info->mclk = i2s_cfg->frame_clk_freq * mclk_multiple;
-		i2s_hal_clock_info->bclk_div = i2s_hal_clock_info->mclk / i2s_hal_clock_info->bclk;
-	}
+		i2s_hal_clock_info->bclk_div = MAX(
+			DIV_ROUND_UP(i2s_hal_clock_info->mclk, i2s_hal_clock_info->bclk), 2U);
+		i2s_hal_clock_info->mclk =
+			i2s_hal_clock_info->bclk * i2s_hal_clock_info->bclk_div;
 
 #if defined(CONFIG_I2S_ESP32_CLK_SRC_APLL)
-	uint32_t apll_div;
+		uint32_t apll_div;
 
-	i2s_hal_clock_info->sclk = i2s_esp32_set_apll_freq(i2s_hal_clock_info->mclk, &apll_div);
-	if (i2s_hal_clock_info->sclk == 0) {
-		return ESP_ERR_INVALID_ARG;
-	}
-	/* What the APLL actually makes, so the MCLK divider stays an integer */
-	i2s_hal_clock_info->mclk = i2s_hal_clock_info->sclk / apll_div;
+		i2s_hal_clock_info->sclk =
+			i2s_esp32_set_apll_freq(i2s_hal_clock_info->mclk, &apll_div);
+		if (i2s_hal_clock_info->sclk == 0) {
+			return ESP_ERR_INVALID_ARG;
+		}
+		/* What the APLL actually makes, so the MCLK divider stays an integer */
+		i2s_hal_clock_info->mclk = i2s_hal_clock_info->sclk / apll_div;
 #else
-	i2s_hal_clock_info->sclk = i2s_esp32_get_source_clk_freq(I2S_ESP32_CLK_SRC);
+		i2s_hal_clock_info->sclk = i2s_esp32_get_source_clk_freq(I2S_ESP32_CLK_SRC);
 #endif
+	}
+
 	i2s_hal_clock_info->mclk_div = i2s_hal_clock_info->sclk / i2s_hal_clock_info->mclk;
 	if (i2s_hal_clock_info->mclk_div == 0) {
 		LOG_DBG("Sample rate is too large for the current clock source");
@@ -1277,6 +1310,8 @@ static int i2s_esp32_initialize(const struct device *dev)
 
 #ifdef CONFIG_SOC_SERIES_ESP32P4
 	esp_clk_tree_enable_src((soc_module_clk_t)I2S_ESP32_CLK_SRC, true);
+	/* Clock targets run from the 160 MHz PLL (i2s_esp32_clk_src()) */
+	esp_clk_tree_enable_src((soc_module_clk_t)I2S_CLK_SRC_PLL_160M, true);
 #endif
 	err = clock_control_on(clk_dev, dev_cfg->clock_subsys);
 	if (err != 0) {
@@ -1370,6 +1405,23 @@ static int i2s_esp32_initialize(const struct device *dev)
 	return 0;
 }
 
+static bool i2s_esp32_data_format_ok(uint8_t data_format)
+{
+	switch (data_format) {
+	case I2S_FMT_DATA_FORMAT_I2S:
+	case I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED:
+	case I2S_FMT_DATA_FORMAT_RIGHT_JUSTIFIED:
+		return true;
+#if SOC_I2S_SUPPORTS_TDM
+	case I2S_FMT_DATA_FORMAT_PCM_SHORT:
+	case I2S_FMT_DATA_FORMAT_PCM_LONG:
+		return true;
+#endif /* SOC_I2S_SUPPORTS_TDM */
+	default:
+		return false;
+	}
+}
+
 static int i2s_esp32_config_check(const struct device *dev, enum i2s_dir dir,
 				  const struct i2s_config *i2s_cfg)
 {
@@ -1460,9 +1512,7 @@ static int i2s_esp32_config_check(const struct device *dev, enum i2s_dir dir,
 
 	data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
 
-	if (data_format != I2S_FMT_DATA_FORMAT_I2S &&
-	    data_format != I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED &&
-	    data_format != I2S_FMT_DATA_FORMAT_RIGHT_JUSTIFIED) {
+	if (!i2s_esp32_data_format_ok(data_format)) {
 		LOG_DBG("Invalid data format: %u", (unsigned int)data_format);
 		return -EINVAL;
 	}
@@ -1478,10 +1528,17 @@ static int i2s_esp32_config_check(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
+#if SOC_I2S_SUPPORTS_TDM
+	if (i2s_cfg->channels < 1U || i2s_cfg->channels > I2S_ESP32_TDM_SLOTS_MAX) {
+		LOG_DBG("Unsupported number of channels: %u", i2s_cfg->channels);
+		return -EINVAL;
+	}
+#else
 	if (i2s_cfg->channels != 2) {
 		LOG_DBG("Currently only 2 channels are supported");
 		return -EINVAL;
 	}
+#endif /* SOC_I2S_SUPPORTS_TDM */
 
 	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
 		LOG_DBG("Unsupported option: I2S_OPT_LOOPBACK");
@@ -1497,6 +1554,110 @@ static int i2s_esp32_config_check(const struct device *dev, enum i2s_dir dir,
 	return 0;
 }
 
+static int i2s_esp32_std_slot_cfg(const struct i2s_config *i2s_cfg,
+				  i2s_hal_slot_config_t *slot_cfg)
+{
+	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+
+	if (data_format == I2S_FMT_DATA_FORMAT_I2S) {
+		slot_cfg->std.ws_pol = i2s_cfg->format & I2S_FMT_FRAME_CLK_INV ? true : false;
+		slot_cfg->std.bit_shift = true;
+#if SOC_I2S_HW_VERSION_2
+		slot_cfg->std.left_align = true;
+#endif /* SOC_I2S_HW_VERSION_2 */
+	} else if (data_format == I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED) {
+		slot_cfg->std.ws_pol = i2s_cfg->format & I2S_FMT_FRAME_CLK_INV ? false : true;
+		slot_cfg->std.bit_shift = false;
+#if SOC_I2S_HW_VERSION_2
+		slot_cfg->std.left_align = true;
+	} else if (data_format == I2S_FMT_DATA_FORMAT_RIGHT_JUSTIFIED) {
+		slot_cfg->std.ws_pol = i2s_cfg->format & I2S_FMT_FRAME_CLK_INV ? false : true;
+		slot_cfg->std.bit_shift = false;
+		slot_cfg->std.left_align = false;
+#endif /* SOC_I2S_HW_VERSION_2 */
+	} else {
+		LOG_DBG("Unsupported data format: %u", (unsigned int)data_format);
+		return -EINVAL;
+	}
+
+	slot_cfg->std.ws_width = slot_cfg->slot_bit_width;
+	slot_cfg->std.slot_mask = I2S_STD_SLOT_BOTH;
+#if SOC_I2S_HW_VERSION_1
+	slot_cfg->std.msb_right = true;
+#elif SOC_I2S_HW_VERSION_2
+	slot_cfg->std.big_endian = false;
+	slot_cfg->std.bit_order_lsb = i2s_cfg->format & I2S_FMT_DATA_ORDER_LSB ? true : false;
+#endif /* SOC_I2S_HW_VERSION_1 */
+
+	return 0;
+}
+
+#if SOC_I2S_SUPPORTS_TDM
+/*
+ * TDM frames: i2s_cfg->channels slots of slot_bit_width each.
+ * I2S and the justified formats drive WS for half the frame, as in two-slot
+ * I2S; PCM short pulses it for one BCLK before the first slot, PCM long
+ * holds it for the first slot.
+ */
+static int i2s_esp32_tdm_slot_cfg(const struct i2s_config *i2s_cfg,
+				  i2s_hal_slot_config_t *slot_cfg)
+{
+	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+	bool inv = (i2s_cfg->format & I2S_FMT_FRAME_CLK_INV) != 0;
+	uint32_t frame_bits = (uint32_t)i2s_cfg->channels * slot_cfg->slot_bit_width;
+
+	slot_cfg->tdm.slot_mask = (i2s_tdm_slot_mask_t)BIT_MASK(i2s_cfg->channels);
+	slot_cfg->tdm.total_slot = i2s_cfg->channels;
+	slot_cfg->tdm.skip_mask = false;
+	slot_cfg->tdm.left_align = true;
+	slot_cfg->tdm.big_endian = false;
+	slot_cfg->tdm.bit_order_lsb = (i2s_cfg->format & I2S_FMT_DATA_ORDER_LSB) != 0;
+
+	switch (data_format) {
+	case I2S_FMT_DATA_FORMAT_I2S:
+		slot_cfg->tdm.ws_width = frame_bits / 2U;
+		slot_cfg->tdm.ws_pol = inv;
+		slot_cfg->tdm.bit_shift = true;
+		break;
+	case I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED:
+		slot_cfg->tdm.ws_width = frame_bits / 2U;
+		slot_cfg->tdm.ws_pol = !inv;
+		slot_cfg->tdm.bit_shift = false;
+		break;
+	case I2S_FMT_DATA_FORMAT_RIGHT_JUSTIFIED:
+		slot_cfg->tdm.ws_width = frame_bits / 2U;
+		slot_cfg->tdm.ws_pol = !inv;
+		slot_cfg->tdm.bit_shift = false;
+		slot_cfg->tdm.left_align = false;
+		break;
+	case I2S_FMT_DATA_FORMAT_PCM_SHORT:
+		slot_cfg->tdm.ws_width = 1U;
+		slot_cfg->tdm.ws_pol = !inv;
+		slot_cfg->tdm.bit_shift = true;
+		break;
+	case I2S_FMT_DATA_FORMAT_PCM_LONG:
+		slot_cfg->tdm.ws_width = slot_cfg->slot_bit_width;
+		slot_cfg->tdm.ws_pol = !inv;
+		slot_cfg->tdm.bit_shift = true;
+		break;
+	default:
+		LOG_DBG("Unsupported data format: %u", (unsigned int)data_format);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+#endif /* SOC_I2S_SUPPORTS_TDM */
+
+/* Two-slot I2S and justified formats use standard mode; the rest TDM. */
+static bool i2s_esp32_use_tdm(const struct i2s_config *i2s_cfg)
+{
+	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+
+	return i2s_cfg->channels != 2U || data_format == I2S_FMT_DATA_FORMAT_PCM_SHORT ||
+	       data_format == I2S_FMT_DATA_FORMAT_PCM_LONG;
+}
+
 static int i2s_esp32_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
@@ -1506,6 +1667,7 @@ static int i2s_esp32_configure(const struct device *dev, enum i2s_dir dir,
 	i2s_hal_slot_config_t slot_cfg = {0};
 	uint8_t data_format;
 	bool is_target;
+	bool use_tdm;
 	int err;
 
 	err = i2s_esp32_config_check(dev, dir, i2s_cfg);
@@ -1549,44 +1711,35 @@ static int i2s_esp32_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+	use_tdm = i2s_esp32_use_tdm(i2s_cfg);
 
 	slot_cfg.data_bit_width = i2s_cfg->word_size;
 	slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;
 	slot_cfg.slot_bit_width = i2s_cfg->word_size > 16 ? 32 : 16;
-	if (data_format == I2S_FMT_DATA_FORMAT_I2S) {
-		slot_cfg.std.ws_pol = i2s_cfg->format & I2S_FMT_FRAME_CLK_INV ? true : false;
-		slot_cfg.std.bit_shift = true;
-#if SOC_I2S_HW_VERSION_2
-		slot_cfg.std.left_align = true;
-#endif /* SOC_I2S_HW_VERSION_2 */
-	} else if (data_format == I2S_FMT_DATA_FORMAT_LEFT_JUSTIFIED) {
-		slot_cfg.std.ws_pol = i2s_cfg->format & I2S_FMT_FRAME_CLK_INV ? false : true;
-		slot_cfg.std.bit_shift = false;
-#if SOC_I2S_HW_VERSION_2
-		slot_cfg.std.left_align = true;
-	} else if (data_format == I2S_FMT_DATA_FORMAT_RIGHT_JUSTIFIED) {
-		slot_cfg.std.ws_pol = i2s_cfg->format & I2S_FMT_FRAME_CLK_INV ? false : true;
-		slot_cfg.std.bit_shift = false;
-		slot_cfg.std.left_align = false;
-#endif /* SOC_I2S_HW_VERSION_2 */
+#if SOC_I2S_SUPPORTS_TDM
+	if (use_tdm) {
+		err = i2s_esp32_tdm_slot_cfg(i2s_cfg, &slot_cfg);
+		if (err < 0) {
+			return err;
+		}
 	} else {
-		LOG_DBG("Unsupported data format: %u", (unsigned int)data_format);
-		return -EINVAL;
+		err = i2s_esp32_std_slot_cfg(i2s_cfg, &slot_cfg);
+		if (err < 0) {
+			return err;
+		}
 	}
-
-	slot_cfg.std.ws_width = slot_cfg.slot_bit_width;
-	slot_cfg.std.slot_mask = I2S_STD_SLOT_BOTH;
-#if SOC_I2S_HW_VERSION_1
-	slot_cfg.std.msb_right = true;
-#elif SOC_I2S_HW_VERSION_2
-	slot_cfg.std.big_endian = false;
-	slot_cfg.std.bit_order_lsb = i2s_cfg->format & I2S_FMT_DATA_ORDER_LSB ? true : false;
-#endif /* SOC_I2S_HW_VERSION_1 */
+#else
+	err = i2s_esp32_std_slot_cfg(i2s_cfg, &slot_cfg);
+	if (err < 0) {
+		return err;
+	}
+#endif /* SOC_I2S_SUPPORTS_TDM */
 
 	i2s_hal_clock_info_t i2s_hal_clock_info;
 	i2s_hal_context_t *hal = (i2s_hal_context_t *)&(dev_cfg->hal);
 
-	err = i2s_esp32_calculate_clock(i2s_cfg, slot_cfg.slot_bit_width, &i2s_hal_clock_info);
+	err = i2s_esp32_calculate_clock(i2s_cfg, slot_cfg.slot_bit_width, is_target,
+					&i2s_hal_clock_info);
 	if (err != ESP_OK) {
 		return -EINVAL;
 	}
@@ -1600,9 +1753,36 @@ static int i2s_esp32_configure(const struct device *dev, enum i2s_dir dir,
 			rx_is_target = true;
 		}
 
+#if SOC_I2S_SUPPORTS_TDM
+		if (use_tdm) {
+			i2s_hal_tdm_set_rx_slot(hal, rx_is_target, &slot_cfg);
+			i2s_ll_rx_enable_tdm(hal->dev);
+		} else {
+			i2s_hal_std_set_rx_slot(hal, rx_is_target, &slot_cfg);
+			i2s_ll_rx_enable_std(hal->dev);
+		}
+#else
 		i2s_hal_std_set_rx_slot(hal, rx_is_target, &slot_cfg);
-		i2s_hal_set_rx_clock(hal, &i2s_hal_clock_info, I2S_ESP32_CLK_SRC, NULL);
 		i2s_ll_rx_enable_std(hal->dev);
+#endif /* SOC_I2S_SUPPORTS_TDM */
+		/*
+		 * Receive on transmit's BCK and WS is a clock target, so it
+		 * gets a target's module clock: sampling BCLK with a module
+		 * clock below eight times BCLK puts every word one bit late.
+		 */
+		if (rx_is_target && !is_target) {
+			i2s_hal_clock_info_t rx_clock_info;
+
+			err = i2s_esp32_calculate_clock(i2s_cfg, slot_cfg.slot_bit_width, true,
+							&rx_clock_info);
+			if (err != ESP_OK) {
+				return -EINVAL;
+			}
+			i2s_hal_set_rx_clock(hal, &rx_clock_info, i2s_esp32_clk_src(true), NULL);
+		} else {
+			i2s_hal_set_rx_clock(hal, &i2s_hal_clock_info,
+					     i2s_esp32_clk_src(is_target), NULL);
+		}
 
 		stream = &dev_cfg->rx;
 		memcpy(&stream->data->i2s_cfg, i2s_cfg, sizeof(struct i2s_config));
@@ -1612,9 +1792,20 @@ static int i2s_esp32_configure(const struct device *dev, enum i2s_dir dir,
 
 #if I2S_ESP32_IS_DIR_EN(tx)
 	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
+#if SOC_I2S_SUPPORTS_TDM
+		if (use_tdm) {
+			i2s_hal_tdm_set_tx_slot(hal, is_target, &slot_cfg);
+			i2s_ll_tx_enable_tdm(hal->dev);
+		} else {
+			i2s_hal_std_set_tx_slot(hal, is_target, &slot_cfg);
+			i2s_ll_tx_enable_std(hal->dev);
+		}
+#else
 		i2s_hal_std_set_tx_slot(hal, is_target, &slot_cfg);
-		i2s_hal_set_tx_clock(hal, &i2s_hal_clock_info, I2S_ESP32_CLK_SRC, NULL);
 		i2s_ll_tx_enable_std(hal->dev);
+#endif /* SOC_I2S_SUPPORTS_TDM */
+		i2s_hal_set_tx_clock(hal, &i2s_hal_clock_info, i2s_esp32_clk_src(is_target),
+				     NULL);
 
 		stream = &dev_cfg->tx;
 		memcpy(&stream->data->i2s_cfg, i2s_cfg, sizeof(struct i2s_config));
@@ -1622,7 +1813,12 @@ static int i2s_esp32_configure(const struct device *dev, enum i2s_dir dir,
 	}
 #endif /* I2S_ESP32_IS_DIR_EN(tx) */
 
-	if (dev_cfg->rx.data && dev_cfg->rx.data->configured && dev_cfg->tx.data &&
+	/*
+	 * As clock controller in full duplex, receive runs on transmit's BCK
+	 * and WS. As target each direction takes them from its own inputs,
+	 * which pinctrl routes from the same pins.
+	 */
+	if (!is_target && dev_cfg->rx.data && dev_cfg->rx.data->configured && dev_cfg->tx.data &&
 	    dev_cfg->tx.data->configured) {
 		i2s_ll_share_bck_ws(hal->dev, true);
 	} else {
