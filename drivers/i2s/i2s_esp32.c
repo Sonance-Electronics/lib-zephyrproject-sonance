@@ -287,6 +287,42 @@ static int i2s_esp32_stop_transfer(const struct device *dev, enum i2s_dir dir);
 #if I2S_ESP32_IS_DIR_EN(rx)
 
 #if SOC_GDMA_SUPPORTED
+/*
+ * Links a fresh block behind the one in flight, so the DMA moves on to it at
+ * the EOF without a stop: at high rates the RX FIFO does not hold the data
+ * that arrives while the callback restarts the channel. Only for blocks of
+ * one chunk; larger ones are restarted chunk by chunk as before. Called
+ * while the channel runs, with interrupts locked or from the DMA callback.
+ */
+static void IRAM_ATTR i2s_esp32_rx_link_next(const struct device *dev)
+{
+	const struct i2s_esp32_cfg *const dev_cfg = dev->config;
+	const struct i2s_esp32_stream *stream = &dev_cfg->rx;
+	void *block;
+	int err;
+
+	if (stream->data->next_block != NULL || stream->data->mem_block == NULL ||
+	    stream->data->i2s_cfg.block_size > I2S_ESP32_DMA_BUFFER_MAX_SIZE) {
+		return;
+	}
+
+	if (k_mem_slab_alloc(stream->data->i2s_cfg.mem_slab, &block, K_NO_WAIT) < 0) {
+		return;
+	}
+
+	err = dma_reload(stream->conf->dma_dev, stream->conf->dma_channel, (uint32_t)NULL,
+			 (uint32_t)block, stream->data->i2s_cfg.block_size);
+	if (err < 0) {
+		k_mem_slab_free(stream->data->i2s_cfg.mem_slab, block);
+		return;
+	}
+
+	stream->data->next_block = block;
+	stream->data->next_block_len = stream->data->i2s_cfg.block_size;
+}
+#endif /* SOC_GDMA_SUPPORTED */
+
+#if SOC_GDMA_SUPPORTED
 static void IRAM_ATTR i2s_esp32_rx_callback(const struct device *dma_dev, void *arg,
 					    uint32_t channel, int status)
 #else
@@ -404,6 +440,19 @@ static void IRAM_ATTR i2s_esp32_rx_callback(void *arg, int status)
 		goto rx_disable;
 	}
 
+#if SOC_GDMA_SUPPORTED
+	if (stream->data->next_block != NULL) {
+		/* The DMA has moved on to the linked block: link the one after it */
+		stream->data->mem_block = stream->data->next_block;
+		stream->data->mem_block_len = stream->data->next_block_len;
+		stream->data->next_block = NULL;
+		stream->data->next_block_len = 0;
+		stream->data->dma_pending = true;
+		i2s_esp32_rx_link_next(dev);
+		return;
+	}
+#endif /* SOC_GDMA_SUPPORTED */
+
 	err = k_mem_slab_alloc(stream->data->i2s_cfg.mem_slab, &stream->data->mem_block, K_NO_WAIT);
 	if (err < 0) {
 		LOG_DBG("RX failed to allocate memory from slab: %i:", err);
@@ -493,6 +542,10 @@ static int i2s_esp32_rx_start_transfer(const struct device *dev)
 		return -EIO;
 	}
 
+#if SOC_GDMA_SUPPORTED
+	i2s_esp32_rx_link_next(dev);
+#endif /* SOC_GDMA_SUPPORTED */
+
 	i2s_hal_rx_start(hal);
 
 #if !SOC_GDMA_SUPPORTED
@@ -540,6 +593,11 @@ static int IRAM_ATTR i2s_esp32_rx_stop_transfer(const struct device *dev)
 	if (stream->data->mem_block != NULL) {
 		k_mem_slab_free(stream->data->i2s_cfg.mem_slab, stream->data->mem_block);
 		stream->data->mem_block = NULL;
+	}
+	if (stream->data->next_block != NULL) {
+		k_mem_slab_free(stream->data->i2s_cfg.mem_slab, stream->data->next_block);
+		stream->data->next_block = NULL;
+		stream->data->next_block_len = 0;
 	}
 #else
 	/* Legacy DMA may still own the block; do not return it to the slab. */
