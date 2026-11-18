@@ -51,6 +51,14 @@ config I2S_ESP32_RX_BLOCK_HOOK
 	  example to timestamp it. i2s_read() only says when the block was
 	  taken, which can be any time after that.
 
+config I2S_ESP32_TX_BLOCK_HOOK
+	bool "Call i2s_esp32_tx_block_done() as each transmitted block completes"
+	help
+	  Calls i2s_esp32_tx_block_done() from the DMA completion interrupt
+	  once for each block the DMA has finished reading, just before the
+	  block goes back to its slab, so that an application can tell the
+	  transmit word clock's phase, for example to lock it to a time base.
+
 config I2S_ESP32_TX_BLOCK_COUNT
 	int "ESP32 I2S TX block count"
 	default 5

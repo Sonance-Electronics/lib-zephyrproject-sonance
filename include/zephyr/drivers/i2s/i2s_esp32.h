@@ -32,6 +32,20 @@ extern "C" {
  */
 void i2s_esp32_rx_block_done(const struct device *dev, void *mem_block);
 
+/**
+ * @brief Called as each transmitted block completes.
+ *
+ * With CONFIG_I2S_ESP32_TX_BLOCK_HOOK, the driver calls this from its DMA
+ * completion interrupt once for each block the DMA has finished reading,
+ * just before the block goes back to its slab. A block's samples leave the
+ * pin a FIFO's depth later. The default does nothing; it runs in interrupt
+ * context and must be placed in IRAM.
+ *
+ * @param dev I2S device.
+ * @param mem_block The block that was sent.
+ */
+void i2s_esp32_tx_block_done(const struct device *dev, void *mem_block);
+
 #ifdef __cplusplus
 }
 #endif

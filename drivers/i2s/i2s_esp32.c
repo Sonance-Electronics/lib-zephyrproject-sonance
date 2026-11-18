@@ -485,6 +485,14 @@ __weak void IRAM_ATTR i2s_esp32_rx_block_done(const struct device *dev, void *me
 }
 #endif /* CONFIG_I2S_ESP32_RX_BLOCK_HOOK */
 
+#ifdef CONFIG_I2S_ESP32_TX_BLOCK_HOOK
+__weak void IRAM_ATTR i2s_esp32_tx_block_done(const struct device *dev, void *mem_block)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(mem_block);
+}
+#endif /* CONFIG_I2S_ESP32_TX_BLOCK_HOOK */
+
 #if !SOC_GDMA_SUPPORTED
 
 static void IRAM_ATTR i2s_esp32_rx_handler(void *arg)
@@ -789,6 +797,9 @@ static void IRAM_ATTR i2s_esp32_tx_callback(void *arg, int status)
 	}
 #endif /* SOC_GDMA_SUPPORTED */
 
+	if (IS_ENABLED(CONFIG_I2S_ESP32_TX_BLOCK_HOOK)) {
+		i2s_esp32_tx_block_done(dev, stream->data->mem_block);
+	}
 	k_mem_slab_free(stream->data->i2s_cfg.mem_slab, stream->data->mem_block);
 	stream->data->mem_block = NULL;
 	stream->data->mem_block_len = 0;
@@ -824,6 +835,9 @@ static void IRAM_ATTR i2s_esp32_tx_callback(void *arg, int status)
 		 * interrupts merged): release it as well and go on as at the end
 		 * of a chain, instead of staying a block behind for good.
 		 */
+		if (IS_ENABLED(CONFIG_I2S_ESP32_TX_BLOCK_HOOK)) {
+			i2s_esp32_tx_block_done(dev, stream->data->mem_block);
+		}
 		k_mem_slab_free(stream->data->i2s_cfg.mem_slab, stream->data->mem_block);
 		stream->data->mem_block = NULL;
 		stream->data->mem_block_len = 0;
