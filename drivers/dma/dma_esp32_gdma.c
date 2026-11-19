@@ -139,13 +139,20 @@ struct dma_esp32_channel {
 	void *user_data;
 	esp_dma_desc_t desc_list[CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM];
 	/*
-	 * TX reload with a transfer in flight: the halves of desc_list are
-	 * used in turn, tail is the last descriptor of the chain, in_flight
-	 * the chains not completed.
+	 * Reload with a transfer in flight: the halves of desc_list are used
+	 * in turn, tail is the last descriptor of the chain, in_flight the
+	 * chains not completed.
 	 */
 	esp_dma_desc_t *tail;
 	uint8_t next_slot;
 	uint8_t in_flight;
+	/*
+	 * RX: started and not stopped since, so a reload is linked behind;
+	 * whether one was, and the half of desc_list the oldest chain is in.
+	 */
+	bool rx_running;
+	bool rx_appended;
+	uint8_t rx_done_slot;
 	/* TX: started and not stopped since */
 	bool tx_started;
 #if CONFIG_PM
@@ -211,6 +218,24 @@ static inline bool dma_ll_tx_is_fsm_idle(struct dma_esp32_data *data, int ch)
 	return ahb_dma_ll_tx_is_desc_fsm_idle(data->hal.ahb_dma_dev, ch);
 }
 
+/*
+ * Whether a TX transfer is still running. Here the descriptor FSM parks as
+ * soon as it has fetched the descriptor it works on, while the data FSM
+ * goes on moving the data, so the park bit alone reads idle through most
+ * of a transfer. Running means either FSM is not idle.
+ */
+static inline bool dma_ll_tx_is_running(struct dma_esp32_data *data, int ch)
+{
+	if (data->is_axi) {
+		return !axi_dma_ll_tx_is_desc_fsm_idle(data->hal.axi_dma_dev, ch) ||
+		       data->hal.axi_dma_dev->out[ch].conf.out_state.out_dscr_state_chn != 0 ||
+		       data->hal.axi_dma_dev->out[ch].conf.out_state.out_state_chn != 0;
+	}
+	return !ahb_dma_ll_tx_is_desc_fsm_idle(data->hal.ahb_dma_dev, ch) ||
+	       data->hal.ahb_dma_dev->channel[ch].out.out_state.out_dscr_state_chn != 0 ||
+	       data->hal.ahb_dma_dev->channel[ch].out.out_state.out_state_chn != 0;
+}
+
 static inline intptr_t dma_ll_rx_get_prefetched_desc(struct dma_esp32_data *data, int ch)
 {
 	if (data->is_axi) {
@@ -256,6 +281,11 @@ static inline bool dma_ll_tx_is_fsm_idle(struct dma_esp32_data *data, int ch)
 	return gdma_ll_tx_is_desc_fsm_idle(data->hal.dev, ch);
 }
 
+static inline bool dma_ll_tx_is_running(struct dma_esp32_data *data, int ch)
+{
+	return !gdma_ll_tx_is_desc_fsm_idle(data->hal.dev, ch);
+}
+
 static inline intptr_t dma_ll_rx_get_prefetched_desc(struct dma_esp32_data *data, int ch)
 {
 	return gdma_ll_rx_get_prefetched_desc_addr(data->hal.dev, ch);
@@ -280,13 +310,11 @@ static inline void dma_ll_force_reg_clock(struct dma_esp32_data *data, bool en)
 
 /*
  * Whether a TX channel still has a chain to send. On ESP32-P4 the FSMs can
- * read idle while a transfer is still running: the descriptor FSM parks as
- * soon as it has fetched the descriptor it works on, and both read idle
- * while the peripheral holds the transfer off (an I2S clock target between
- * frames). There a started channel runs until every chain linked into it
- * has raised its EOF. Two EOFs taken by one interrupt count as one, which
- * leaves the channel looking busy after it ended; the peripheral driver's
- * own timeout has to catch that.
+ * read idle while the peripheral holds off a running transfer (an I2S clock
+ * target between frames), so there a started channel runs until every
+ * chain linked into it has raised its EOF. Two EOFs taken by one interrupt
+ * count as one, which leaves the channel looking busy after it ended; the
+ * peripheral driver's own timeout has to catch that.
  */
 static bool IRAM_ATTR dma_esp32_tx_running(struct dma_esp32_data *data,
 					   struct dma_esp32_channel *dma_channel)
@@ -296,7 +324,7 @@ static bool IRAM_ATTR dma_esp32_tx_running(struct dma_esp32_data *data,
 	return dma_channel->tx_started && dma_channel->tail != NULL &&
 	       dma_channel->in_flight > 0U;
 #else
-	return !dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id);
+	return dma_ll_tx_is_running(data, dma_channel->channel_id);
 #endif
 }
 
@@ -522,6 +550,45 @@ static void IRAM_ATTR dma_esp32_cache_invd_data(struct dma_esp32_channel *dma_ch
 	}
 }
 
+/*
+ * With chains linked behind each other (dma_esp32_rx_append()), only the one
+ * that completed: the chain in the half of desc_list it started in.
+ */
+static void IRAM_ATTR dma_esp32_cache_invd_done_chain(struct dma_esp32_data *data,
+						      struct dma_esp32_channel *dma_channel)
+{
+	const size_t half = ARRAY_SIZE(dma_channel->desc_list) / 2;
+	esp_dma_desc_t *first = dma_channel->desc_list + (dma_channel->rx_done_slot ? half : 0);
+	esp_dma_desc_t *desc = first;
+	k_spinlock_key_t key;
+
+	/*
+	 * Only the buffers: the descriptors' fields read here are the CPU's
+	 * own, and invalidating desc_list would round out to cache lines
+	 * holding this struct's other fields.
+	 */
+	for (size_t i = 0; i < half && desc != NULL; ++i) {
+		if (desc->buffer && desc->dw0.size) {
+			dma_esp32_invd_keep_edges(desc->buffer, desc->dw0.size);
+		}
+		if (desc->next < first || desc->next >= first + half) {
+			break;
+		}
+		desc = desc->next;
+	}
+
+	key = k_spin_lock(&data->lock);
+	dma_channel->rx_done_slot ^= 1;
+	if (dma_channel->in_flight > 0U) {
+		dma_channel->in_flight--;
+	}
+	if (dma_channel->in_flight == 0U) {
+		/* The chain ran out: the next reload starts afresh */
+		dma_channel->rx_running = false;
+	}
+	k_spin_unlock(&data->lock, key);
+}
+
 static void IRAM_ATTR dma_esp32_isr_handle_rx(const struct device *dev,
 					      struct dma_esp32_channel *rx, uint32_t intr_status)
 {
@@ -531,8 +598,14 @@ static void IRAM_ATTR dma_esp32_isr_handle_rx(const struct device *dev,
 
 	gdma_hal_clear_intr(&data->hal, rx->channel_id, GDMA_CHANNEL_DIRECTION_RX, intr_status);
 
-	if (intr_status & GDMA_LL_EVENT_RX_SUC_EOF) {
+	if ((intr_status & GDMA_LL_EVENT_RX_SUC_EOF) && rx->rx_appended) {
+		dma_esp32_cache_invd_done_chain(data, rx);
+		status = DMA_STATUS_COMPLETE;
+		pm_unlock = true;
+	} else if (intr_status & GDMA_LL_EVENT_RX_SUC_EOF) {
 		dma_esp32_cache_invd_data(rx);
+		rx->in_flight = 0;
+		rx->rx_running = false;
 		status = DMA_STATUS_COMPLETE;
 		pm_unlock = true;
 	} else if (intr_status & GDMA_LL_EVENT_RX_DONE) {
@@ -704,6 +777,9 @@ static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 	dma_channel->tail = desc_iter;
 	dma_channel->next_slot = 1;
 	dma_channel->in_flight = 1;
+	dma_channel->rx_done_slot = 0;
+	dma_channel->rx_appended = false;
+	dma_channel->rx_running = false;
 	dma_channel->tx_started = false;
 
 	/* Write back cache so the GDMA hardware sees fresh descriptor values.
@@ -1025,6 +1101,9 @@ static int dma_esp32_start(const struct device *dev, uint32_t channel)
 		k_spin_unlock(&data->lock, key);
 	} else {
 		if (dma_channel->dir == DMA_RX) {
+			if (dma_channel->rx_running) {
+				return 0; /* already running, the reload is linked behind */
+			}
 			dma_esp32_rx_rearm(data, dma_channel->channel_id);
 			gdma_hal_enable_intr(
 				&data->hal, dma_channel->channel_id, GDMA_CHANNEL_DIRECTION_RX,
@@ -1032,6 +1111,8 @@ static int dma_esp32_start(const struct device *dev, uint32_t channel)
 			gdma_hal_start_with_desc(&data->hal, dma_channel->channel_id,
 						 GDMA_CHANNEL_DIRECTION_RX,
 						 (intptr_t)dma_channel->desc_list);
+			dma_channel->rx_running =
+				dma_channel->periph_id != SOC_GDMA_TRIG_PERIPH_M2M0;
 		} else if (dma_channel->dir == DMA_TX) {
 			if (dma_esp32_tx_running(data, dma_channel)) {
 				return 0; /* already running, the reload is linked behind */
@@ -1095,6 +1176,8 @@ static int dma_esp32_stop(const struct device *dev, uint32_t channel)
 
 	dma_channel->tail = NULL;
 	dma_channel->in_flight = 0;
+	dma_channel->rx_running = false;
+	dma_channel->rx_appended = false;
 	dma_channel->tx_started = false;
 	k_spin_unlock(&data->lock, key);
 
@@ -1251,6 +1334,79 @@ static int IRAM_ATTR dma_esp32_tx_append(struct dma_esp32_data *data,
 	return 0;
 }
 
+/*
+ * Links an RX buffer behind the chain in flight, as dma_esp32_tx_append()
+ * does for TX, so a peripheral that ends each buffer with an EOF (I2S) is
+ * received without a gap between buffers.
+ */
+static int IRAM_ATTR dma_esp32_rx_append(struct dma_esp32_data *data,
+					 struct dma_esp32_channel *dma_channel, uint32_t dst,
+					 size_t size)
+{
+	const size_t half = ARRAY_SIZE(dma_channel->desc_list) / 2;
+	esp_dma_desc_t *slot, *desc_iter;
+	k_spinlock_key_t key;
+
+	if (half == 0 || size > half * DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED) {
+		return -ENOSPC;
+	}
+
+	if (!esp_ptr_dma_capable((uint32_t *)dst)) {
+		return -EINVAL;
+	}
+
+	/* No dirty line of the buffer may be written back over what the DMA writes. */
+	sys_cache_data_flush_and_invd_range((void *)dst, size);
+
+	key = k_spin_lock(&data->lock);
+
+	/* A stop on another CPU may have ended the chain since the caller looked */
+	if (dma_channel->tail == NULL || dma_channel->in_flight >= 2) {
+		k_spin_unlock(&data->lock, key);
+		return -EBUSY;
+	}
+
+	/* The chain in flight must not reach into the slot, not only end in it. */
+	slot = dma_channel->desc_list + (dma_channel->next_slot ? half : 0);
+	if ((slot != dma_channel->desc_list && dma_channel->tail >= slot) ||
+	    (slot == dma_channel->desc_list && dma_channel->tail < slot + half)) {
+		k_spin_unlock(&data->lock, key);
+		return -EBUSY;
+	}
+
+	desc_iter = slot;
+	for (size_t i = 0; i < half; ++i) {
+		memset(desc_iter, 0, sizeof(esp_dma_desc_t));
+		desc_iter->buffer = (void *)(dst + DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED * i);
+		desc_iter->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+		if (size <= DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED) {
+			desc_iter->dw0.size = size;
+			desc_iter->next = NULL;
+			break;
+		}
+		desc_iter->dw0.size = DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED;
+		size -= DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED;
+		desc_iter->next = desc_iter + 1;
+		desc_iter += 1;
+	}
+
+	sys_cache_data_flush_range(slot, half * sizeof(esp_dma_desc_t));
+
+	/* The restart makes the GDMA fetch the tail's next pointer again if it parked. */
+	dma_channel->tail->next = slot;
+	sys_cache_data_flush_range(dma_channel->tail, sizeof(esp_dma_desc_t));
+	gdma_hal_append(&data->hal, dma_channel->channel_id, GDMA_CHANNEL_DIRECTION_RX);
+
+	dma_channel->tail = desc_iter;
+	dma_channel->next_slot ^= 1;
+	dma_channel->in_flight++;
+	dma_channel->rx_appended = true;
+
+	k_spin_unlock(&data->lock, key);
+
+	return 0;
+}
+
 static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t src, uint32_t dst,
 			    size_t size)
 {
@@ -1278,6 +1434,11 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 	if (dma_channel->dir == DMA_TX && dma_channel->periph_id != SOC_GDMA_TRIG_PERIPH_M2M0 &&
 	    dma_channel->tail != NULL && dma_esp32_tx_running(data, dma_channel)) {
 		return dma_esp32_tx_append(data, dma_channel, src, size);
+	}
+
+	/* A running RX channel likewise takes the buffer as the next one. */
+	if (dma_channel->dir == DMA_RX && dma_channel->rx_running && dma_channel->tail != NULL) {
+		return dma_esp32_rx_append(data, dma_channel, dst, size);
 	}
 
 	if (size > ARRAY_SIZE(dma_channel->desc_list) *
@@ -1332,6 +1493,8 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 	dma_channel->tail = desc_iter;
 	dma_channel->next_slot = 1;
 	dma_channel->in_flight = 1;
+	dma_channel->rx_done_slot = 0;
+	dma_channel->rx_appended = false;
 	dma_channel->tx_started = false;
 	k_spin_unlock(&data->lock, key);
 
