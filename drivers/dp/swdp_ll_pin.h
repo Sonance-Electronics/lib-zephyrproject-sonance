@@ -19,10 +19,26 @@ static ALWAYS_INLINE void pin_delay_asm(uint32_t delay)
 			:
 			: "cc"
 			);
+#elif defined(CONFIG_RISCV)
+	__asm volatile("1:\n"
+		       "addi %0, %0, -1\n"
+		       "bnez %0, 1b\n"
+		       : "+r"(delay));
 #else
 #warning "Pin delay is not defined"
 #endif
 }
+
+/* Roles of the SWD pins, for SoCs that keep per-role state while the port is on */
+enum swdp_ll_role {
+	SWDP_LL_ROLE_CLK,
+	SWDP_LL_ROLE_DIO,
+	SWDP_LL_ROLE_DOUT,
+	SWDP_LL_ROLE_DNOE,
+	/* SWDIO output: DOUT if present, otherwise DIO */
+	SWDP_LL_ROLE_SWDIO_OUT,
+	SWDP_LL_ROLE_COUNT,
+};
 
 #if defined(CONFIG_SOC_SERIES_NRF52) || defined(CONFIG_SOC_SERIES_NRF53)
 
@@ -35,6 +51,10 @@ static ALWAYS_INLINE void pin_delay_asm(uint32_t delay)
 #elif defined(CONFIG_SOC_FAMILY_MCXA)
 
 #include "swdp_ll_pin_mcx.h"
+
+#elif defined(CONFIG_SOC_SERIES_ESP32P4)
+
+#include "swdp_ll_pin_esp32.h"
 
 #else
 
@@ -63,6 +83,47 @@ static ALWAYS_INLINE uint32_t swdp_ll_pin_get(void *const base, uint8_t pin)
 	return 0UL;
 }
 
+#endif
+
+#ifndef SWDP_LL_HAS_PORT_HOOKS
+/*
+ * Optional hooks for SoCs that switch the SWD pins to a faster access path
+ * while the debug port is on. The role operations return true when they
+ * handled the access, and false to fall back to the base/pin operations.
+ */
+static ALWAYS_INLINE void swdp_ll_port_attach(void *const base, uint8_t pin, bool output,
+					      enum swdp_ll_role role)
+{
+}
+
+static ALWAYS_INLINE void swdp_ll_port_detach(void *const base, uint8_t pin)
+{
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_set(enum swdp_ll_role role)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_clr(enum swdp_ll_role role)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_get(enum swdp_ll_role role, uint32_t *const val)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_output(enum swdp_ll_role role)
+{
+	return false;
+}
+
+static ALWAYS_INLINE bool swdp_ll_role_input(enum swdp_ll_role role)
+{
+	return false;
+}
 #endif
 
 #ifndef CPU_CLOCK
