@@ -48,8 +48,16 @@ LOG_MODULE_REGISTER(esp_hosted_mcu, CONFIG_WIFI_LOG_LEVEL);
 #define ESP_HOSTED_MCU_WIFI_IF_STA 0
 #define ESP_HOSTED_MCU_WIFI_IF_AP  1
 
-/* SAE PWE derivation: 0=HUNT_AND_PECK, 1=HASH_TO_ELEMENT, 2=BOTH. */
-#define ESP_HOSTED_MCU_SAE_PWE_BOTH 2
+/*
+ * Coprocessor-side wifi_sae_pwe_method_t values (esp_wifi): 0=UNSPECIFIED,
+ * 1=HUNT_AND_PECK, 2=HASH_TO_ELEMENT, 3=BOTH.
+ */
+#define ESP_HOSTED_MCU_SAE_PWE_BOTH 3
+
+/* Coprocessor-side wifi_auth_mode_t values used as the STA threshold */
+#define ESP_HOSTED_MCU_AUTH_OPEN     0
+#define ESP_HOSTED_MCU_AUTH_WPA2_PSK 3
+#define ESP_HOSTED_MCU_AUTH_WPA3_PSK 6
 
 /* Coprocessor-side wifi_ps_type_t values (esp_wifi): none, min and max modem. */
 #define ESP_HOSTED_MCU_PS_NONE      0
@@ -381,6 +389,28 @@ static int esp_hosted_mcu_connect(const struct device *dev, struct net_if *iface
 		sta->has_pmf_cfg = true;
 		sta->pmf_cfg.capable = true;
 		sta->sae_pwe_h2e = ESP_HOSTED_MCU_SAE_PWE_BOTH;
+	}
+
+	/*
+	 * Without a threshold the coprocessor derives WPA2 from the password
+	 * length, and without the required flag it advertises PMF as optional.
+	 * Pass both on so a WPA3-only AP with PMF required accepts the
+	 * association.
+	 */
+	if (params->mfp == WIFI_MFP_REQUIRED) {
+		sta->has_pmf_cfg = true;
+		sta->pmf_cfg.capable = true;
+		sta->pmf_cfg.required = true;
+	}
+
+	sta->has_threshold = true;
+	if (sta->sae_pwe_h2e == ESP_HOSTED_MCU_SAE_PWE_BOTH) {
+		sta->threshold.authmode = ESP_HOSTED_MCU_AUTH_WPA3_PSK;
+	} else if (params->security == WIFI_SECURITY_TYPE_PSK ||
+		   params->security == WIFI_SECURITY_TYPE_PSK_SHA256) {
+		sta->threshold.authmode = ESP_HOSTED_MCU_AUTH_WPA2_PSK;
+	} else {
+		sta->threshold.authmode = ESP_HOSTED_MCU_AUTH_OPEN;
 	}
 
 	ret = esp_hosted_mcu_rpc_call(&req, &resp, ESP_HOSTED_MCU_RPC_TIMEOUT);
