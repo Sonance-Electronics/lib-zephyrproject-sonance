@@ -657,13 +657,15 @@ static uint16_t dap_swdp_sequence(struct dap_link_context *const ctx,
 	}
 
 	for (size_t i = 0; i < count; ++i) {
+		/* Sequence info: bit 7 input, bits 5..0 cycle count with 64 as 0 */
 		input = *request_data & BIT(7);
-		num_cycles = *request_data & BIT_MASK(7);
-		num_bytes = (num_cycles + 7) >> 3; /* rounded up to full bytes */
+		num_cycles = *request_data & BIT_MASK(6);
 
 		if (num_cycles == 0) {
 			num_cycles = 64;
 		}
+
+		num_bytes = (num_cycles + 7) >> 3; /* rounded up to full bytes */
 
 		request_data += 1;
 
