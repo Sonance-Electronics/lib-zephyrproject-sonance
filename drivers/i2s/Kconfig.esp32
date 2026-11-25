@@ -76,6 +76,7 @@ config I2S_ESP32_ALLOWED_EMPTY_TX_QUEUE_DEFERRAL_TIME_MS
 	int "ESP32 I2S empty TX queue processing deferral time"
 	default 0
 	help
-	  Allowed deferral time for processing an empty tx queue in milliseconds
+	  Allowed deferral time for processing an empty tx queue in milliseconds.
+	  A block written within this time restarts the transfer at once.
 
 endif

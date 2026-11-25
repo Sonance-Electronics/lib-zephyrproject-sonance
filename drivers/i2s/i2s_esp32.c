@@ -122,6 +122,8 @@ struct i2s_esp32_data {
 	i2s_hal_clock_info_t clk_info;
 #if I2S_ESP32_IS_DIR_EN(tx)
 	struct k_timer tx_deferred_transfer_timer;
+	/* tx_deferred_transfer_timer runs for an empty queue, not a stop */
+	bool tx_deferred;
 	const struct device *dev;
 #endif
 };
@@ -704,6 +706,8 @@ void IRAM_ATTR i2s_esp32_tx_compl_transfer(struct k_timer *timer)
 	struct queue_item item;
 	int err;
 
+	dev_data->tx_deferred = false;
+
 	if (dev_data->state == I2S_STATE_ERROR) {
 		goto tx_disable;
 	}
@@ -848,6 +852,7 @@ static void IRAM_ATTR i2s_esp32_tx_callback(void *arg, int status)
 #if CONFIG_I2S_ESP32_ALLOWED_EMPTY_TX_QUEUE_DEFERRAL_TIME_MS
 	if (k_msgq_num_used_get(&stream->data->queue) == 0 &&
 	    dev_data->state != I2S_STATE_STOPPING) {
+		dev_data->tx_deferred = true;
 		k_timer_start(&dev_data->tx_deferred_transfer_timer,
 			      K_MSEC(CONFIG_I2S_ESP32_ALLOWED_EMPTY_TX_QUEUE_DEFERRAL_TIME_MS),
 			      K_NO_WAIT);
@@ -951,6 +956,7 @@ static int IRAM_ATTR i2s_esp32_tx_stop_transfer(const struct device *dev)
 	int err = 0;
 
 	k_timer_stop(&dev_data->tx_deferred_transfer_timer);
+	dev_data->tx_deferred = false;
 
 #if SOC_GDMA_SUPPORTED
 	err = dma_stop(stream->conf->dma_dev, stream->conf->dma_channel);
@@ -2169,6 +2175,22 @@ static int i2s_esp32_read(const struct device *dev, void **mem_block, size_t *si
 #endif /* I2S_ESP32_IS_DIR_EN(rx) */
 }
 
+#if I2S_ESP32_IS_DIR_EN(tx)
+/* A block queued while the queue ran empty: the I2S FIFO may still be playing,
+ * so restart now rather than at the deadline.
+ */
+static void i2s_esp32_tx_end_deferral(struct i2s_esp32_data *dev_data)
+{
+	unsigned int key = irq_lock();
+
+	if (dev_data->tx_deferred) {
+		k_timer_stop(&dev_data->tx_deferred_transfer_timer);
+		i2s_esp32_tx_compl_transfer(&dev_data->tx_deferred_transfer_timer);
+	}
+	irq_unlock(key);
+}
+#endif /* I2S_ESP32_IS_DIR_EN(tx) */
+
 static int i2s_esp32_write(const struct device *dev, void *mem_block, size_t size)
 {
 #if I2S_ESP32_IS_DIR_EN(tx)
@@ -2227,9 +2249,14 @@ static int i2s_esp32_write(const struct device *dev, void *mem_block, size_t siz
 			 SYS_TIMEOUT_MS(stream->data->i2s_cfg.timeout));
 	if (err < 0) {
 		LOG_DBG("TX queue full");
+		return err;
 	}
 
-	return err;
+	if (CONFIG_I2S_ESP32_ALLOWED_EMPTY_TX_QUEUE_DEFERRAL_TIME_MS > 0) {
+		i2s_esp32_tx_end_deferral(dev_data);
+	}
+
+	return 0;
 #else
 	LOG_DBG("TX not enabled");
 	return -EIO;
