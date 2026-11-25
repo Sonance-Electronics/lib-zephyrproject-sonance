@@ -328,6 +328,22 @@ static bool IRAM_ATTR dma_esp32_tx_running(struct dma_esp32_data *data,
 #endif
 }
 
+/*
+ * A started AXI GDMA TX channel takes a reload as the next buffer even once
+ * its chain has ended: Restart resumes a finished transfer (TRM 6.4.4), while
+ * a reset would drop data still in the channel FIFO.
+ */
+static bool IRAM_ATTR dma_esp32_tx_appendable(struct dma_esp32_data *data,
+					      struct dma_esp32_channel *dma_channel)
+{
+#if SOC_AXI_GDMA_SUPPORTED
+	ARG_UNUSED(data);
+	return dma_channel->tx_started;
+#else
+	return dma_esp32_tx_running(data, dma_channel);
+#endif
+}
+
 /* Select a peripheral ID for a memory-to-memory pair and reserve it */
 static int dma_esp32_m2m_reserve(const struct device *dev, uint8_t channel_id)
 {
@@ -640,8 +656,13 @@ static void IRAM_ATTR dma_esp32_isr_handle_tx(const struct device *dev,
 	gdma_hal_clear_intr(&data->hal, tx->channel_id, GDMA_CHANNEL_DIRECTION_TX, intr_status);
 	if ((intr_status & GDMA_LL_EVENT_TX_EOF) != 0U) {
 		k_spinlock_key_t key = k_spin_lock(&data->lock);
+		uint32_t eof = gdma_hal_get_eof_desc_addr(&data->hal, tx->channel_id,
+							  GDMA_CHANNEL_DIRECTION_TX, true);
 
-		if (tx->in_flight > 0U) {
+		/* EOF interrupts merge when a chain ends before the previous one's is handled */
+		if (eof == (uint32_t)(uintptr_t)tx->tail) {
+			tx->in_flight = 0;
+		} else if (tx->in_flight > 0U) {
 			tx->in_flight--;
 		}
 		k_spin_unlock(&data->lock, key);
@@ -1432,7 +1453,7 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 
 	/* A running TX channel takes the buffer as the next one, as with eDMA. */
 	if (dma_channel->dir == DMA_TX && dma_channel->periph_id != SOC_GDMA_TRIG_PERIPH_M2M0 &&
-	    dma_channel->tail != NULL && dma_esp32_tx_running(data, dma_channel)) {
+	    dma_channel->tail != NULL && dma_esp32_tx_appendable(data, dma_channel)) {
 		return dma_esp32_tx_append(data, dma_channel, src, size);
 	}
 
