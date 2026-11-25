@@ -146,6 +146,7 @@ struct dma_esp32_channel {
 	esp_dma_desc_t *tail;
 	uint8_t next_slot;
 	uint8_t in_flight;
+	bool tx_started;
 #if CONFIG_PM
 	bool pm_lock_held;
 #endif
@@ -535,6 +536,16 @@ static void IRAM_ATTR dma_esp32_isr_handle_rx(const struct device *dev,
 	}
 }
 
+/*
+ * OUTLINK_PARK is the state of the descriptor FSM (TRM 6.4), which idles once
+ * the last descriptor is fetched while its data is still moving. A TX chain
+ * is therefore tracked in software: started, and an EOF still to come.
+ */
+static inline bool dma_esp32_tx_busy(const struct dma_esp32_channel *dma_channel)
+{
+	return dma_channel->tx_started && dma_channel->in_flight > 0U;
+}
+
 static void IRAM_ATTR dma_esp32_isr_handle_tx(const struct device *dev,
 					      struct dma_esp32_channel *tx, uint32_t intr_status)
 {
@@ -543,8 +554,13 @@ static void IRAM_ATTR dma_esp32_isr_handle_tx(const struct device *dev,
 	gdma_hal_clear_intr(&data->hal, tx->channel_id, GDMA_CHANNEL_DIRECTION_TX, intr_status);
 	if ((intr_status & GDMA_LL_EVENT_TX_EOF) != 0U) {
 		k_spinlock_key_t key = k_spin_lock(&data->lock);
+		uint32_t eof = gdma_hal_get_eof_desc_addr(&data->hal, tx->channel_id,
+							  GDMA_CHANNEL_DIRECTION_TX, true);
 
-		if (tx->in_flight > 0U) {
+		/* EOF interrupts merge when a chain ends before the previous one's is handled */
+		if (eof == (uint32_t)(uintptr_t)tx->tail) {
+			tx->in_flight = 0;
+		} else if (tx->in_flight > 0U) {
 			tx->in_flight--;
 		}
 		k_spin_unlock(&data->lock, key);
@@ -680,6 +696,7 @@ static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 	dma_channel->tail = desc_iter;
 	dma_channel->next_slot = 1;
 	dma_channel->in_flight = 1;
+	dma_channel->tx_started = false;
 
 	/* Write back cache so the GDMA hardware sees fresh descriptor values.
 	 * No-op when CACHE_MANAGEMENT is disabled (SoCs without a data cache).
@@ -1008,9 +1025,10 @@ static int dma_esp32_start(const struct device *dev, uint32_t channel)
 						 GDMA_CHANNEL_DIRECTION_RX,
 						 (intptr_t)dma_channel->desc_list);
 		} else if (dma_channel->dir == DMA_TX) {
-			if (!dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id)) {
+			if (dma_esp32_tx_busy(dma_channel)) {
 				return 0; /* already running, the reload is linked behind */
 			}
+			dma_channel->tx_started = true;
 			gdma_hal_enable_intr(&data->hal, dma_channel->channel_id,
 					     GDMA_CHANNEL_DIRECTION_TX, GDMA_LL_EVENT_TX_EOF, true);
 			gdma_hal_start_with_desc(&data->hal, dma_channel->channel_id,
@@ -1067,6 +1085,7 @@ static int dma_esp32_stop(const struct device *dev, uint32_t channel)
 
 	dma_channel->tail = NULL;
 	dma_channel->in_flight = 0;
+	dma_channel->tx_started = false;
 
 	return 0;
 }
@@ -1127,7 +1146,7 @@ static int IRAM_ATTR dma_esp32_get_status(const struct device *dev, uint32_t cha
 				dma_channel->desc_list[0].dw0.size * status->read_position;
 		}
 	} else if (dma_channel->dir == DMA_TX) {
-		status->busy = !dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id);
+		status->busy = dma_esp32_tx_busy(dma_channel);
 		status->dir = MEMORY_TO_PERIPHERAL;
 		desc = (esp_dma_desc_t *)dma_ll_tx_get_prefetched_desc(data,
 								       dma_channel->channel_id);
@@ -1243,9 +1262,13 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		return -EINVAL;
 	}
 
-	/* A running TX channel takes the buffer as the next one, as with eDMA. */
+	/*
+	 * A started TX channel takes the buffer as the next one, as with eDMA,
+	 * also once its chain has ended: Restart resumes a finished transfer
+	 * (TRM 6.4.4), while a reset would drop data still in the channel FIFO.
+	 */
 	if (dma_channel->dir == DMA_TX && dma_channel->periph_id != SOC_GDMA_TRIG_PERIPH_M2M0 &&
-	    dma_channel->tail != NULL && !dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id)) {
+	    dma_channel->tail != NULL && dma_channel->tx_started) {
 		return dma_esp32_tx_append(data, dma_channel, src, size);
 	}
 
@@ -1301,6 +1324,7 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 	dma_channel->tail = desc_iter;
 	dma_channel->next_slot = 1;
 	dma_channel->in_flight = 1;
+	dma_channel->tx_started = false;
 	k_spin_unlock(&data->lock, key);
 
 	sys_cache_data_flush_range(dma_channel->desc_list, sizeof(dma_channel->desc_list));

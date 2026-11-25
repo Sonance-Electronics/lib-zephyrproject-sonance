@@ -11,6 +11,7 @@ tests:
     platform_allow:
       - nrf5340dk/nrf5340/cpuapp
       - nrf54h20dk/nrf54h20/cpuapp
+      - waveshare_esp32p4_eth/esp32p4/hpcore
     harness: TBD
 
   sample.subsys.usb.uac2_explicit_feedback.legacy_nrf_clock:

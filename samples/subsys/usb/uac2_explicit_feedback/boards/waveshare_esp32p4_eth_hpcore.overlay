@@ -1,0 +1,41 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * I2S0 TX on the expansion header so it can be probed. The onboard codec is
+ * left unconfigured.
+ *
+ *   signal  GPIO  header pin
+ *   BCLK    3     14
+ *   WS      4     12
+ *   DOUT    2     15
+ *   GND           13
+ *
+ * The WS pad's input is also routed to PCNT unit 0 for explicit feedback
+ * (src/feedback_esp32.c), so no external loopback wire is needed.
+ */
+
+#include "../app.overlay"
+
+&pinctrl {
+	i2s0_header: i2s0_header {
+		group1 {
+			pinmux = <ESP32_PINMUX(3, ESP_NOSIG, ESP_I2S0_O_BCK_OUT)>,
+				 <ESP32_PINMUX(4, ESP_PCNT_SIG_CH0_IN0, ESP_I2S0_O_WS_OUT)>,
+				 <ESP32_PINMUX(2, ESP_NOSIG, ESP_I2S0_O_SD_OUT)>;
+			output-enable;
+			input-enable;
+		};
+	};
+};
+
+i2s_tx: &i2s0 {
+	status = "okay";
+	pinctrl-0 = <&i2s0_header>;
+	pinctrl-names = "default";
+	dmas = <&dma 1>;
+	dma-names = "tx";
+};
+
+&dma {
+	status = "okay";
+};
